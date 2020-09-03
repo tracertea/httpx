@@ -12,16 +12,20 @@ import (
 	"github.com/microcosm-cc/bluemonday"
 	"github.com/projectdiscovery/httpx/common/cache"
 	"github.com/projectdiscovery/httpx/common/httputilz"
+	"github.com/projectdiscovery/rawhttp"
 	retryablehttp "github.com/projectdiscovery/retryablehttp-go"
+	"golang.org/x/net/http2"
 )
 
 // HTTPX represent an instance of the library client
 type HTTPX struct {
-	client        *retryablehttp.Client
-	Filters       []Filter
-	Options       *Options
-	htmlPolicy    *bluemonday.Policy
-	CustomHeaders map[string]string
+	client          *retryablehttp.Client
+	client2         *http.Client
+	Filters         []Filter
+	Options         *Options
+	htmlPolicy      *bluemonday.Policy
+	CustomHeaders   map[string]string
+	RequestOverride *RequestOverride
 }
 
 // New httpx instance
@@ -84,15 +88,34 @@ func New(options *Options) (*HTTPX, error) {
 		CheckRedirect: redirectFunc,
 	}, retryablehttpOptions)
 
+	httpx.client2 = &http.Client{
+		Transport: &http2.Transport{
+			TLSClientConfig: &tls.Config{
+				InsecureSkipVerify: true,
+			},
+			AllowHTTP: true,
+		},
+		Timeout: httpx.Options.Timeout,
+	}
+
 	httpx.htmlPolicy = bluemonday.NewPolicy()
 	httpx.CustomHeaders = httpx.Options.CustomHeaders
+	httpx.RequestOverride = &options.RequestOverride
 
 	return httpx, nil
 }
 
 // Do http request
 func (h *HTTPX) Do(req *retryablehttp.Request) (*Response, error) {
-	httpresp, err := h.client.Do(req)
+	var (
+		httpresp *http.Response
+		err      error
+	)
+	if h.Options.Unsafe {
+		httpresp, err = h.doUnsafe(req)
+	} else {
+		httpresp, err = h.client.Do(req)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -106,7 +129,7 @@ func (h *HTTPX) Do(req *retryablehttp.Request) (*Response, error) {
 		return nil, err
 	}
 
-	resp.Raw = string(rawresp)
+	resp.Raw = rawresp
 
 	var respbody []byte
 	// websockets don't have a readable body
@@ -134,10 +157,27 @@ func (h *HTTPX) Do(req *retryablehttp.Request) (*Response, error) {
 	// number of lines
 	resp.Lines = len(strings.Split(respbodystr, "\n"))
 
-	// extracts TLS data if any
-	resp.TlsData = h.TlsGrab(httpresp)
+	if !h.Options.Unsafe {
+		// extracts TLS data if any
+		resp.TlsData = h.TlsGrab(httpresp)
+	}
+
+	resp.CspData = h.CspGrab(httpresp)
 
 	return &resp, nil
+}
+
+type RequestOverride struct {
+	URIPath string
+}
+
+// Do http request
+func (h *HTTPX) doUnsafe(req *retryablehttp.Request) (*http.Response, error) {
+	method := req.Method
+	headers := req.Header
+	url := req.URL.String()
+	body := req.Body
+	return rawhttp.DoRaw(method, url, h.RequestOverride.URIPath, headers, body)
 }
 
 // Verify the http calls and apply-cascade all the filters, as soon as one matches it returns true
